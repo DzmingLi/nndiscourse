@@ -24,6 +24,8 @@
 (require 'nnheader)
 (require 'rfc2047)
 (require 'mail-parse)
+(require 'message)
+(require 'mm-decode)
 
 (defgroup nndiscourse nil "Discourse topic subscriptions." :group 'gnus)
 (nnoo-declare nndiscourse)
@@ -298,8 +300,77 @@ Commit only a fully validated snapshot.  CALLBACK receives an error or nil."
 (deffoo nndiscourse-request-type (_group &optional _article) 'post)
 (deffoo nndiscourse-asynchronous-p () nil)
 (deffoo nndiscourse-close-group (_group &optional _server) t)
-(deffoo nndiscourse-request-post (&optional _server)
-  (nnheader-report 'nndiscourse "Posting is not available in this revision"))
+(defun nndiscourse--body ()
+  "Read a plain Markdown body from the current Message buffer."
+  (save-excursion
+    (message-goto-body)
+    (let ((body (buffer-substring-no-properties (point) (point-max)))
+          (type (message-fetch-field "Content-Type")))
+      (when (or (and type (not (string-match-p "\\`text/plain\\(?:;\\|\\'\\)" (downcase type))))
+                (string-match-p "<#\\(?:part\\|multipart\\|secure\\|external\\)" body))
+        (error "Discourse composer supports plain Markdown only; remove attachments"))
+      (when (string-empty-p (string-trim body)) (error "Empty Discourse post"))
+      body)))
+
+(defun nndiscourse--submit (db group parent title body &optional category)
+  "Post BODY to GROUP, with PARENT floor or a new TITLE and CATEGORY.
+Persist an uncertain-send lock before network dispatch."
+  (let* ((kind (if category "topic" "reply"))
+         (fingerprint (secure-hash 'sha256 (prin1-to-string
+                                           (list (nndiscourse--db-base db) kind
+                                                 (and group (plist-get group :id)) parent title category body))))
+         (previous (cl-find fingerprint (nndiscourse--db-attempts db)
+                            :key (lambda (a) (plist-get a :fingerprint)) :test #'equal))
+         (attempt (or previous (list :fingerprint fingerprint :state "pending")))
+         (fields (if category `(("title" ,title) ("raw" ,body) ("category" ,(number-to-string category)))
+                   `(("topic_id" ,(number-to-string (plist-get group :id)))
+                     ("reply_to_post_number" ,(number-to-string parent)) ("raw" ,body))))
+         result failure uncertain)
+    (when (and previous (equal (plist-get previous :state) "pending"))
+      (error "Previous send is uncertain; inspect the site before clearing the lock"))
+    (when (and previous (equal (plist-get previous :state) "sent"))
+      (error "This exact post was already sent; refresh the topic"))
+    (unless previous (push attempt (nndiscourse--db-attempts db)))
+    (setf (plist-get attempt :state) "pending")
+    (nndiscourse--save db)
+    (condition-case problem
+        (pcase-let ((`(,data ,err ,maybe)
+                     (nndiscourse--await
+                      (lambda (cb)
+                        (nndiscourse--http db 'post "/posts.json" fields
+                                          (lambda (payload reason unsure) (funcall cb payload reason unsure)))))))
+          (setq result data failure err uncertain maybe))
+      (error (setq failure (error-message-string problem) uncertain t)))
+    (unless failure
+      (unless (and (nndiscourse--positive-p (plist-get result :id))
+                   (nndiscourse--positive-p (plist-get result :topic_id))
+                   (nndiscourse--positive-p (plist-get result :post_number))
+                   (if category
+                       (= (plist-get result :post_number) 1)
+                     (and (equal (plist-get result :topic_id) (plist-get group :id))
+                          (equal (plist-get result :reply_to_post_number) parent))))
+        (setq failure "Discourse did not confirm this post; check the website before retrying"
+              uncertain t)))
+    (unless uncertain (setf (plist-get attempt :state) (if failure "failed" "sent")))
+    (nndiscourse--save db)
+    (when failure (error "%s" failure))
+    result))
+
+(deffoo nndiscourse-request-post (&optional server)
+  "Publish a native Gnus followup to a known Discourse floor."
+  (condition-case problem
+      (let* ((db (nndiscourse--select server))
+             (raw-group (message-fetch-field "Newsgroups"))
+             (name (and raw-group (gnus-group-real-name raw-group)))
+             (record (and name (nndiscourse--group db name)))
+             (refs (split-string (or (message-fetch-field "References") "")))
+             (target (and record (nndiscourse--post db record (car (last refs))))))
+        (unless (and record target (not (plist-get target :missing))
+                     (not (string-match-p "[,\r\n]" raw-group)))
+          (error "Reply to one known Discourse floor; crossposting is unsupported"))
+        (nndiscourse--submit db record (plist-get target :number) nil (nndiscourse--body))
+        t)
+    (error (nnheader-report 'nndiscourse "%s" (error-message-string problem)))))
 
 (deffoo nndiscourse-request-group (group &optional server _fast _info)
   (let ((record (nndiscourse--group (nndiscourse--select server) group)))
@@ -388,6 +459,119 @@ Commit only a fully validated snapshot.  CALLBACK receives an error or nil."
      (lambda (failure)
        (if failure (message "Topic update failed: %s" failure)
          (with-current-buffer gnus-group-buffer (gnus-group-read-group t t full)))))))
+
+(defvar-local nndiscourse--compose-base nil)
+(defvar-local nndiscourse--compose-category nil)
+(defvar-local nndiscourse--compose-sending nil)
+(defvar-local nndiscourse--compose-sent nil)
+(defvar nndiscourse-compose-topic-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map message-mode-map)
+    (define-key map [remap message-send] #'nndiscourse-compose-send)
+    (define-key map [remap message-send-and-exit] #'nndiscourse-compose-send-and-exit)
+    (define-key map (kbd "C-c C-c") #'nndiscourse-compose-send-and-exit)
+    (define-key map (kbd "C-c C-s") #'nndiscourse-compose-send)
+    map))
+(define-derived-mode nndiscourse-compose-topic-mode message-mode "Discourse-Topic"
+  "Compose a new Discourse topic with Message's editor."
+  (setq-local message-send-method-alist
+              '((nndiscourse nndiscourse--message-p nndiscourse--message-guard))))
+(defun nndiscourse--message-p ()
+  "Recognize a Discourse topic draft in Message's transport selection."
+  (derived-mode-p 'nndiscourse-compose-topic-mode))
+(defun nndiscourse--message-guard (&rest _)
+  "Prevent direct Message transport from delivering a topic as mail or news."
+  (user-error "Use nndiscourse-compose-send or C-c C-c"))
+
+(defun nndiscourse--categories (db)
+  "Read accessible categories from DB's site as (LABEL . ID) pairs."
+  (pcase-let ((`(,data ,failure ,_)
+               (nndiscourse--await (lambda (cb)
+                                     (nndiscourse--http db 'get "/categories.json" nil cb)))))
+    (when failure (error "%s" failure))
+    (let* ((items (plist-get (plist-get data :category_list) :categories))
+           (valid (cl-remove-if-not
+                   (lambda (item) (and (nndiscourse--positive-p (plist-get item :id))
+                                       (stringp (plist-get item :name)))) items)))
+      (unless valid (error "No accessible categories returned"))
+      (mapcar
+       (lambda (item)
+         (let* ((parent (cl-find (plist-get item :parent_category_id) valid
+                                 :key (lambda (candidate) (plist-get candidate :id))))
+                (label (concat (if parent (concat (plist-get parent :name) " / ") "")
+                               (plist-get item :name)
+                               (format " [%d]" (plist-get item :id)))))
+           (cons label (plist-get item :id)))) valid))))
+
+;;;###autoload
+(defun nndiscourse-compose-topic (site)
+  "Select a category on SITE and compose a new topic in message-mode."
+  (interactive "sDiscourse site URL: ")
+  (let* ((base (discourse-auth-base site))
+         (server (nndiscourse--server-for base))
+         (db (progn (unless (nndiscourse-open-server server `((nndiscourse-address ,base)))
+                      (error "%s" nndiscourse-status-string))
+                    (nndiscourse--select server)))
+         (categories (nndiscourse--categories db))
+         (choice (completing-read "Post in category: " categories nil t))
+         (category (cdr (assoc choice categories)))
+         (buffer (generate-new-buffer "*Discourse new topic*")))
+    (with-current-buffer buffer
+      (nndiscourse-compose-topic-mode)
+      (setq nndiscourse--compose-base base nndiscourse--compose-category category)
+      (insert "Subject: \n" mail-header-separator "\n")
+      (setq-local header-line-format (format "Discourse · %s · %s" base choice))
+      (goto-char (point-min)) (end-of-line))
+    (pop-to-buffer buffer)
+    buffer))
+
+(defun nndiscourse-compose-send (&optional exit)
+  "Publish this topic.  With EXIT, close the draft after confirmation."
+  (interactive)
+  (unless (derived-mode-p 'nndiscourse-compose-topic-mode) (user-error "Not a Discourse topic draft"))
+  (when nndiscourse--compose-sending (user-error "Submission is already in progress"))
+  (when nndiscourse--compose-sent (user-error "This topic was already sent"))
+  (let* ((base nndiscourse--compose-base)
+         (server (nndiscourse--server-for base))
+         (category nndiscourse--compose-category)
+         (title (string-trim (or (message-fetch-field "Subject") "")))
+         (body (nndiscourse--body))
+         result)
+    (unless (and (not (string-empty-p title)) (not (string-match-p "[\r\n]" title)))
+      (user-error "Enter a single-line topic title"))
+    (setq nndiscourse--compose-sending t)
+    (unwind-protect
+        (progn
+          (unless (nndiscourse-open-server server `((nndiscourse-address ,base)))
+            (error "%s" nndiscourse-status-string))
+          (setq result (nndiscourse--submit (nndiscourse--select server) nil nil title body category))
+          (setq nndiscourse--compose-sent t buffer-read-only t)
+          (set-buffer-modified-p nil)
+          (message "Discourse topic published: %s/t/%d" base (plist-get result :topic_id))
+          (run-at-time 0 nil #'nndiscourse-subscribe-topic
+                       (format "%s/t/%d" base (plist-get result :topic_id)))
+          (when exit
+            (let ((draft (current-buffer)))
+              (when (get-buffer-window draft) (quit-window nil (get-buffer-window draft)))
+              (kill-buffer draft))))
+      (when (buffer-live-p (current-buffer)) (setq nndiscourse--compose-sending nil)))))
+
+(defun nndiscourse-compose-send-and-exit ()
+  "Publish this topic and close the confirmed draft."
+  (interactive)
+  (nndiscourse-compose-send t))
+
+;;;###autoload
+(defun nndiscourse-clear-uncertain-sends ()
+  "Clear pending send locks only after checking the website for duplicates."
+  (interactive)
+  (unless (yes-or-no-p "Checked the Discourse website and confirmed these posts were NOT published? ")
+    (user-error "Pending submissions remain locked"))
+  (let ((db (nndiscourse--select)))
+    (setf (nndiscourse--db-attempts db)
+          (cl-remove "pending" (nndiscourse--db-attempts db)
+                     :test #'equal :key (lambda (item) (plist-get item :state))))
+    (nndiscourse--save db)))
 
 (add-to-list 'gnus-valid-select-methods '(nndiscourse "discourse"))
 (nnoo-define-skeleton nndiscourse)
