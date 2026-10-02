@@ -1,59 +1,106 @@
-;;; nndiscourse-test.el --- Test utilities for nndiscourse  -*- lexical-binding: t; coding: utf-8 -*-
-
-;; The following is a derivative work of
-;; https://github.com/millejoh/emacs-ipython-notebook
-;; licensed under GNU General Public License v3.0.
-
-(custom-set-default 'gnus-home-directory (concat default-directory "tests"))
-(custom-set-default 'message-directory (concat default-directory "tests/Mail"))
-(custom-set-variables
- '(auto-revert-verbose nil)
- '(auto-revert-stop-on-user-input nil)
- '(gnus-batch-mode t)
- '(gnus-use-dribble-file nil)
- '(gnus-read-newsrc-file nil)
- '(gnus-save-killed-list nil)
- '(gnus-save-newsrc-file nil)
- '(gnus-secondary-select-methods (quote ((nndiscourse "meta.discourse.org"))))
- '(gnus-select-method (quote (nnnil)))
- '(gnus-message-highlight-citation nil)
- '(gnus-verbose 8)
- '(gnus-large-ephemeral-newsgroup 4000)
- '(gnus-large-newsgroup 4000)
- '(gnus-interactive-exit (quote quiet)))
-
-(require 'nndiscourse)
+;;; nndiscourse-test.el --- Native backend tests -*- lexical-binding: t; -*-
 (require 'ert)
-(require 'message)
-
-(setq ert-runner-profile nil)
-(mapc (lambda (key-params)
-        (when (string-match-p (car key-params) "nndiscourse")
-          (let ((params (cdr key-params)))
-            (setq params (assq-delete-all 'gnus-thread-sort-functions params))
-            (setcdr key-params params))))
-      gnus-parameters)
-
-(defun nndiscourse-test-wait-for (predicate &optional predargs ms interval continue)
-  "Wait until PREDICATE function returns non-`nil'.
-  PREDARGS is argument list for the PREDICATE function.
-  MS is milliseconds to wait.  INTERVAL is polling interval in milliseconds."
-  (let* ((int (or interval (if ms (max 300 (/ ms 10)) 300)))
-         (count (max 1 (if ms (truncate (/ ms int)) 25))))
-    (unless (or (cl-loop repeat count
-                         when (apply predicate predargs)
-                         return t
-                         do (sleep-for (/ int 1000.0)))
-                continue)
-      (error "Timeout: %s" predicate))))
-
-;; if yes-or-no-p isn't specially overridden, make it always "yes"
-(let ((original-yes-or-no-p (symbol-function 'yes-or-no-p)))
-  (add-function :around (symbol-function 'message-cancel-news)
-                (lambda (f &rest args)
-                  (if (not (eq (symbol-function 'yes-or-no-p) original-yes-or-no-p))
-                      (apply f args)
-                    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _args) t)))
-                      (apply f args))))))
-
-(provide 'nndiscourse-test)
+(require 'nndiscourse)
+(defmacro nndiscourse-test-with-db (&rest body)
+  (declare (indent 0))
+  `(let* ((directory (make-temp-file "nndiscourse-test-" t))
+          (db (nndiscourse--load "https://example.org" (expand-file-name "state.json" directory)))
+          (nndiscourse--state db)
+          (auth-sources nil)
+          (discourse-auth--credentials (make-hash-table :test #'equal)))
+     (unwind-protect (progn ,@body) (delete-directory directory t))))
+(defun nndiscourse-test-post (id floor &optional parent)
+  (list :id id :post_number floor :topic_id 42 :reply_to_post_number parent
+        :username "someone" :created_at "2026-10-01T12:00:00Z" :cooked "<p>正文</p>"))
+(defun nndiscourse-test-topic ()
+  (list :id 42 :title "Example" :post_stream
+        (list :stream '(100 110 140) :posts (list (nndiscourse-test-post 100 1)))))
+(ert-deftest nndiscourse-test-url-identity ()
+  (dolist (url '("https://example.org/t/42" "https://example.org/t/42/7"
+                 "https://example.org/t/slug/42/7?x=1" "https://example.org/t/slug/42.json"))
+    (should (equal '("https://example.org" 42) (nndiscourse--location url))))
+  (should (equal '("https://example.org:8443/forum" 42)
+                 (nndiscourse--location "https://EXAMPLE.org:8443/forum/t/slug/42")))
+  (dolist (url '("http://example.org/t/42" "https://user@example.org/t/42" "https://example.org/t/0"
+                 "https://example.org/t/42/7/9" "https://example.org/t/slug/42\r\nInjected"))
+    (should-error (nndiscourse--location url))))
+(ert-deftest nndiscourse-test-pagination-and-native-headers ()
+  (nndiscourse-test-with-db
+    (let ((calls 0) failure)
+      (cl-letf (((symbol-function 'nndiscourse--http)
+                 (lambda (_db _method path fields callback)
+                   (cl-incf calls)
+                   (funcall callback
+                            (if (equal path "/t/42.json") (nndiscourse-test-topic)
+                              (should (equal path "/t/42/posts.json"))
+                              (should (equal '(("post_ids[]" "110") ("post_ids[]" "140")) fields))
+                              (list :post_stream (list :posts (list (nndiscourse-test-post 110 3 1)
+                                                                  (nndiscourse-test-post 140 7 3))))) nil nil))))
+        (nndiscourse-update "topic.42" nil (lambda (err) (setq failure err))))
+      (should-not failure) (should (= calls 2))
+      (let* ((group (nndiscourse--group db "topic.42"))
+             (posts (plist-get group :posts))
+             (header (nndiscourse--header db group (car (last posts)))))
+        (should (equal '(1 3 7) (mapcar (lambda (p) (plist-get p :number)) posts)))
+        (should (equal (nndiscourse--message-id db group 3) (mail-header-references header)))
+        (should (equal (nndiscourse--db-groups db)
+                       (nndiscourse--db-groups (nndiscourse--load "https://example.org" (nndiscourse--db-file db)))))
+        (should (= #o600 (logand #o777 (file-modes (nndiscourse--db-file db)))))))))
+(ert-deftest nndiscourse-test-partial-fetch-does-not-replace-cache ()
+  (nndiscourse-test-with-db
+    (let* ((group (nndiscourse--group db "topic.42" t)) failure)
+      (setf (plist-get group :title) "Old snapshot")
+      (cl-letf (((symbol-function 'nndiscourse--http)
+                 (lambda (_db _method path _fields cb)
+                   (funcall cb (if (equal path "/t/42.json") (nndiscourse-test-topic)
+                                 '(:post_stream (:posts nil))) nil nil))))
+        (nndiscourse-update "topic.42" nil (lambda (err) (setq failure err))))
+      (should failure)
+      (should (equal "Old snapshot" (plist-get (nndiscourse--group db "topic.42") :title)))
+      (should-not (gethash "topic.42" (nndiscourse--db-busy db))))))
+(ert-deftest nndiscourse-test-deleted-parent-and-high-water ()
+  (nndiscourse-test-with-db
+    (let* ((group (nndiscourse--group db "topic.42" t))
+           (_ (setf (plist-get group :high) 99))
+           (snapshot (nndiscourse--normalize db group "Title" (list (nndiscourse-test-post 140 7 3))))
+           (parent (nndiscourse--post db snapshot 3)))
+      (should (plist-get parent :missing))
+      (should (= 99 (plist-get snapshot :high)))
+      (should-not (equal (nndiscourse--message-id db snapshot 3)
+                         (nndiscourse--message-id (make-nndiscourse--db :base "https://elsewhere.org") snapshot 3)))
+      (should-error (nndiscourse--normalize db group "Title" (list (nndiscourse-test-post 140 7 7)))))))
+(ert-deftest nndiscourse-test-scan-only-subscribed-topics ()
+  (nndiscourse-test-with-db
+    (nndiscourse--group db "topic.42" t) (nndiscourse--group db "topic.99" t)
+    (let (scanned)
+      (cl-letf (((symbol-function 'nndiscourse--select) (lambda (&rest _) db))
+                ((symbol-function 'nndiscourse--subscribed-p) (lambda (group _) (equal group "topic.42")))
+                ((symbol-function 'nndiscourse-update)
+                 (lambda (group _server cb) (push group scanned) (funcall cb nil))))
+        (should (nndiscourse-request-scan nil "example.org")))
+      (should (equal '("topic.42") scanned)))))
+(ert-deftest nndiscourse-test-http-credentials-and-destinations ()
+  (nndiscourse-test-with-db
+    (let ((calls 0) failure uncertain)
+      (cl-letf (((symbol-function 'plz)
+                 (lambda (_method _url &rest args)
+                   (cl-incf calls)
+                   (should-not (assoc "Cookie" (plist-get args :headers)))
+                   (should-not (member "--location" plz-curl-default-args))
+                   (funcall (plist-get args :then) (make-plz-response :status 200 :body "{}")))))
+        (nndiscourse--http db 'get "/t/42.json" nil #'ignore)
+        (nndiscourse--http db 'post "/posts.json" nil (lambda (_ e u) (setq failure e uncertain u)))
+        (should failure) (should-not uncertain)
+        (nndiscourse--http db 'get "https://evil.example" nil #'ignore)
+        (should (= calls 1))))))
+(ert-deftest nndiscourse-test-native-article-mime ()
+  (nndiscourse-test-with-db
+    (let* ((group (nndiscourse--normalize db (nndiscourse--group db "topic.42" t) "Title\nInjected: no"
+                                        (list (nndiscourse-test-post 100 1)))))
+      (setf (nndiscourse--db-groups db) (list group))
+      (with-temp-buffer
+        (should (equal '("topic.42" . 1) (nndiscourse-request-article 1 "topic.42" nil (current-buffer))))
+        (should (string-match-p "Content-Transfer-Encoding: base64" (buffer-string)))
+        (should-not (string-match-p "\nInjected:" (buffer-string)))
+        (goto-char (point-min)) (search-forward "\n\n")
+        (should (equal "<p>正文</p>" (decode-coding-string (base64-decode-string (buffer-substring (point) (point-max))) 'utf-8)))))))
