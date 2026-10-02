@@ -1,8 +1,8 @@
 # nndiscourse
 
-Gnus backend for **individual Discourse topics**. This is a GPL-3.0-or-later fork of [dickmao/nndiscourse](https://github.com/dickmao/nndiscourse), retaining the upstream Git history. It replaces the Ruby bridge and forum-wide category crawl with native Emacs HTTP and Discourse User API Keys.
+Gnus backend for Discourse topics, category lists, and replies to you. This is a GPL-3.0-or-later fork of [dickmao/nndiscourse](https://github.com/dickmao/nndiscourse), retaining the upstream Git history. It uses native Emacs HTTP and Discourse User API Keys.
 
-Each topic URL you subscribe to becomes one Gnus group (`topic.ID`); its posts are native articles with stable, site-scoped Message-IDs and References. Gnus owns subscriptions, read/unread/ticked marks and cache. Refresh queries only subscribed topic groups. Unsubscribing with Gnus `u` retains local read state; later scans skip that group. The backend does not subscribe to categories or retrieve their feeds.
+Each topic URL you subscribe to becomes one Gnus group (`topic.ID`); its posts are native articles with stable, site-scoped Message-IDs and References. A `category.ID.slug` group imports topic roots only; Gnus `A T` retrieves the selected topic's replies on demand. A `notifications` group combines replies to you in the same topic into one current article. Gnus owns subscriptions, read/unread/ticked marks and cache. Unsubscribing with Gnus `u` retains local read state; later scans skip that group.
 
 ## Requirements
 
@@ -18,7 +18,11 @@ Clone this repository and put its root on `load-path`:
 
 `M-x nndiscourse-subscribe-topic` accepts a Discourse topic URL such as `https://discourse.nixos.org/t/52296`. It registers exactly that topic in Gnus, fetches the full topic, and opens its group. Subsequent Gnus scans query subscribed topics only. Topic refresh is also available through normal Gnus `g`/`M-g` commands. `M-x discourse-auth-login` authorizes the site for private reads and posting.
 
-`M-x nndiscourse-compose-topic` asks for a forum URL and a category, then opens `message-mode` to write the subject and Markdown body. `C-c C-c` posts and subscribes to the created topic. Reply to a known article using normal Gnus followup, including from `gnus-thread-reader` if you use it. New topic composition looks up category names and IDs through `/categories.json`; this does not subscribe to or read category topics.
+Category groups use the name `category.ID.slug` and a site-specific method, for example `(nndiscourse "emacs-china.org" (nndiscourse-address "https://emacs-china.org"))` with group `category.8.org-mode`. The category's own JSON endpoint supplies only topic roots. Use Gnus `A T` on a root to load its replies. `M-x nndiscourse-subscribe-topic-at-point` turns the selected root into a separately scanned topic group, so newly published replies get their own unread article numbers.
+
+The `notifications` group uses the site's authenticated `/notifications.json` endpoint. It keeps only direct reply notifications (type 2), combines notifications by topic, and gives a topic a new Gnus article number when a new reply arrives. `M-x nndiscourse-open-notification` expands that topic and visits its newest notified floor. Authorize the site with `M-x discourse-auth-login` before scanning this group. Mentions and likes are excluded.
+
+`M-x nndiscourse-compose-topic` asks for a forum URL and a category, then opens `message-mode` to write the subject and Markdown body. `C-c C-c` posts and subscribes to the created topic. Reply to a known article using normal Gnus followup, including from `gnus-thread-reader` if you use it. New topic composition looks up category names and IDs through `/categories.json`.
 
 `gnus-thread-reader` is a **generic** continuous Gnus conversation view; this fork contains no Discourse-specific reading renderer. In a Gnus summary, `M-x gnus-thread-reader-open` works with this backend as with other backends. The native Gnus summary and article buffers work without that package.
 
@@ -43,6 +47,6 @@ emacs --batch --eval '(package-activate-all)' -L . \
   -f ert-run-tests-batch-and-exit
 ```
 
-Tests use synthetic credentials and mocked post responses. Read-only validation fetched a 22-post public topic on `discourse.nixos.org`; no live post was published.
+Tests use synthetic credentials and mocked post responses. Read-only validation fetched 30 topic roots from each of Emacs China's Org-mode and Emacs-general categories; no live post was published.
 
 GPL-3.0-or-later. The full history and license attribution of the original repository are preserved.

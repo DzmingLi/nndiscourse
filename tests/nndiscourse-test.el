@@ -15,6 +15,142 @@
 (defun nndiscourse-test-topic ()
   (list :id 42 :title "Example" :post_stream
         (list :stream '(100 110 140) :posts (list (nndiscourse-test-post 100 1)))))
+(defun nndiscourse-test-latest (&optional reverse)
+  (list :users '((:id 7 :username "original") (:id 8 :username "another"))
+        :topic_list
+        (list :topics
+              (if reverse
+                  '((:id 99 :title "Other" :created_at "2026-09-30T00:00:00Z"
+                     :last_posted_at "2026-10-02T00:00:00Z"
+                     :posters ((:user_id 8)))
+                    (:id 42 :title "Example" :created_at "2026-10-01T00:00:00Z"
+                     :last_posted_at "2026-10-03T00:00:00Z"
+                     :posters ((:user_id 7))))
+                '((:id 42 :title "Example" :created_at "2026-10-01T00:00:00Z"
+                   :last_posted_at "2026-10-01T12:00:00Z"
+                   :posters ((:user_id 7)))
+                  (:id 99 :title "Other" :created_at "2026-09-30T00:00:00Z"
+                   :last_posted_at "2026-10-02T00:00:00Z"
+                   :posters ((:user_id 8))))))))
+
+(ert-deftest nndiscourse-test-latest-roots-and-lazy-replies ()
+  (nndiscourse-test-with-db
+    (let* ((group (nndiscourse--group db "latest" t))
+           (first (nndiscourse--latest-entries group (nndiscourse-test-latest)))
+           (root (nndiscourse--post db first 1))
+           (root-id (nndiscourse--post-message-id db first root)))
+      (should (= 2 (plist-get first :high)))
+      (should (equal "original" (plist-get root :author)))
+      (should-not (plist-get root :body))
+      (should (equal "<topic.42.1." (substring root-id 0 12)))
+      (nndiscourse--replace-group db group first)
+      (cl-letf (((symbol-function 'nndiscourse--http)
+                 (lambda (_db method path _fields cb)
+                   (should (eq method 'get))
+                   (should (equal path "/t/42.json"))
+                   (funcall cb (nndiscourse-test-topic) nil nil))))
+        (with-temp-buffer
+          (should (equal '("latest" . 1)
+                         (nndiscourse-request-article 1 "latest" nil (current-buffer))))
+          (should (string-match-p "Archived-at: <https://example.org/t/42/1>"
+                                  (buffer-string)))))
+      (should (= 2 (length (plist-get (nndiscourse--group db "latest") :posts))))
+      (should (equal "<p>正文</p>"
+                     (plist-get (nndiscourse--post db (nndiscourse--group db "latest") 1)
+                                :body)))
+      (cl-letf (((symbol-function 'nndiscourse--fetch-topic)
+                 (lambda (_db topic cb)
+                   (should (= topic 42))
+                   (funcall cb "Example"
+                            (list (nndiscourse-test-post 100 1)
+                                  (nndiscourse-test-post 110 3 1)
+                                  (nndiscourse-test-post 140 7 3)) nil))))
+        (let* ((record (nndiscourse--group db "latest"))
+               (headers (nndiscourse-request-thread
+                         (nndiscourse--header db record (nndiscourse--post db record 1))
+                         "latest")))
+          (should (= 3 (length headers)))
+          (should (equal root-id (mail-header-id (car headers))))
+          (should (equal (mail-header-id (nth 1 headers))
+                         (mail-header-references (nth 2 headers))))))
+      (let* ((record (nndiscourse--group db "latest"))
+             (posts (plist-get record :posts))
+             (other (cl-find 99 posts :key (lambda (p) (plist-get p :topic-id)))))
+        (should (= 4 (plist-get record :high)))
+        (should (= 2 (plist-get other :number)))
+        (should (= 3 (length (cl-remove-if-not
+                              (lambda (p) (equal 42 (plist-get p :topic-id))) posts))))
+        (let* ((refreshed (nndiscourse--latest-entries record (nndiscourse-test-latest t)))
+               (same-root (nndiscourse--post db refreshed 1)))
+          (should (= 4 (plist-get refreshed :high)))
+          (should (equal root-id (nndiscourse--post-message-id db refreshed same-root)))
+          (should (equal "2026-10-03T00:00:00Z" (plist-get same-root :time))))))))
+
+(ert-deftest nndiscourse-test-latest-rejects-bad-list-without-changing-cache ()
+  (nndiscourse-test-with-db
+    (let* ((record (nndiscourse--group db "latest" t))
+           (snapshot (nndiscourse--latest-entries record (nndiscourse-test-latest)))
+           failure)
+      (nndiscourse--replace-group db record snapshot)
+      (cl-letf (((symbol-function 'nndiscourse--http)
+                 (lambda (_db _method path _fields cb)
+                   (should (equal path "/latest.json"))
+                   (funcall cb '(:topic_list (:topics ((:id 0 :title "Bad")))) nil nil))))
+        (nndiscourse-update "latest" nil (lambda (error) (setq failure error))))
+      (should failure)
+      (should (equal snapshot (nndiscourse--group db "latest")))
+      (should-not (gethash "latest" (nndiscourse--db-busy db))))))
+
+(ert-deftest nndiscourse-test-category-list-uses-category-endpoint ()
+  (nndiscourse-test-with-db
+    (let* ((name "category.8.org-mode")
+           (record (nndiscourse--group db name t)))
+      (should (nndiscourse--list-group-p name))
+      (should (equal "/c/org-mode/8.json" (nndiscourse--list-path name)))
+      (cl-letf (((symbol-function 'nndiscourse--http)
+                 (lambda (_db method path _fields cb)
+                   (should (eq method 'get))
+                   (should (equal path "/c/org-mode/8.json"))
+                   (funcall cb (nndiscourse-test-latest) nil nil))))
+        (let (failure)
+          (nndiscourse-update name nil (lambda (error) (setq failure error)))
+          (should-not failure)))
+      (setq record (nndiscourse--group db name))
+      (should (= 2 (plist-get record :high)))
+      (should (equal "<topic.42.1."
+                     (substring (nndiscourse--post-message-id
+                                 db record (nndiscourse--post db record 1)) 0 12))))))
+
+(ert-deftest nndiscourse-test-notifications-collapse-per-topic-and-renew-unread-number ()
+  (nndiscourse-test-with-db
+    (let* ((record (nndiscourse--group db "notifications" t))
+           (reply '(:id 10 :notification_type 2 :topic_id 42 :post_number 3
+                    :created_at "2026-10-01T12:00:00Z"
+                    :data (:topic_title "Example" :username "alice")))
+           (mention '(:id 11 :notification_type 1 :topic_id 42 :post_number 7
+                      :created_at "2026-10-02T12:00:00Z"
+                      :data (:topic_title "Example" :username "bob")))
+           (first (nndiscourse--notification-entries
+                   db record (list :notifications (list reply mention))))
+           (root (car (plist-get first :posts))))
+      (should (= 1 (length (plist-get first :posts))))
+      (should (equal '(3) (plist-get root :alert-floors)))
+      (should (equal "Example" (plist-get root :title)))
+      (should (string-match-p "Reply #3" (plist-get root :body)))
+      (should-not (string-match-p "#7" (plist-get root :body)))
+      (should (= 1 (plist-get root :number)))
+      (let* ((same (nndiscourse--notification-entries
+                    db first (list :notifications (list mention reply))))
+             (new (nndiscourse--notification-entries
+                   db first
+                   (list :notifications
+                         (cons '(:id 12 :notification_type 2 :topic_id 42
+                                 :post_number 9 :created_at "2026-10-03T12:00:00Z"
+                                 :data (:topic_title "Example" :username "charlie"))
+                               (list mention reply))))))
+        (should (= 1 (plist-get (car (plist-get same :posts)) :number)))
+        (should (= 2 (plist-get (car (plist-get new :posts)) :number)))
+        (should (= 1 (length (plist-get new :posts))))))))
 (ert-deftest nndiscourse-test-url-identity ()
   (dolist (url '("https://example.org/t/42" "https://example.org/t/42/7"
                  "https://example.org/t/slug/42/7?x=1" "https://example.org/t/slug/42.json"))
