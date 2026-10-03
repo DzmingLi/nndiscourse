@@ -2,7 +2,7 @@
 ;; Copyright (C) 2019 The Authors of nndiscourse.el
 ;; Copyright (C) 2026 Dzming Li
 ;; SPDX-License-Identifier: GPL-3.0-or-later
-;; Version: 0.3.1
+;; Version: 0.3.2
 ;; Keywords: news, comm
 ;; URL: https://github.com/DzmingLi/nndiscourse
 ;; Package-Requires: ((emacs "29.1") (plz "0.9.1"))
@@ -109,7 +109,7 @@
 (defun nndiscourse--list-group-p (group)
   "Return non-nil for a latest or category topic list GROUP."
   (and (stringp group)
-       (or (member group '("latest" "notifications"))
+       (or (member group '("latest" "notifications" "search"))
            (string-match-p "\\`category\\.[1-9][0-9]*\\.[[:alnum:]-]+\\'" group))))
 
 (defun nndiscourse--list-path (group)
@@ -146,7 +146,7 @@ No browser cookies, redirects or curlrc.  POST failures may be uncertain."
       (condition-case nil
           (let ((headers (discourse-auth-headers (nndiscourse--db-base db) (eq method 'post))))
             (unless (or (and (eq method 'get)
-                             (string-match-p "\\`/\\(?:t/[1-9][0-9]*\\(?:/posts\\)?\\|categories\\|latest\\|notifications\\|c/[[:alnum:]-]+/[1-9][0-9]*\\)\\.json\\'" path))
+                             (string-match-p "\\`/\\(?:t/[1-9][0-9]*\\(?:/posts\\)?\\|categories\\|latest\\|notifications\\|search\\|c/[[:alnum:]-]+/[1-9][0-9]*\\)\\.json\\'" path))
                         (and (eq method 'post) (equal path "/posts.json")))
               (error "Unsupported endpoint"))
             (let ((query (url-build-query-string fields)))
@@ -437,7 +437,8 @@ No browser cookies, redirects or curlrc.  POST failures may be uncertain."
       (let* ((db (nndiscourse--select server))
              (names (if group (list group) (mapcar (lambda (g) (plist-get g :name)) (nndiscourse--db-groups db)))))
         (dolist (name names)
-          (when (nndiscourse--subscribed-p name (or server (nnoo-current-server 'nndiscourse)))
+          (when (and (not (equal name "search"))
+                     (nndiscourse--subscribed-p name (or server (nnoo-current-server 'nndiscourse))))
             (when-let* ((failure (car (nndiscourse--await (lambda (cb) (nndiscourse-update name server cb))))))
               (error "%s" failure)))) t)
     (error (nnheader-report 'nndiscourse "%s" (error-message-string problem)))))
@@ -642,7 +643,8 @@ Persist an uncertain-send lock before network dispatch."
     (with-current-buffer nntp-server-buffer
       (erase-buffer)
       (dolist (g (nndiscourse--db-groups db))
-        (insert (format "%s %d 1 y\n" (plist-get g :name) (plist-get g :high)))))) t)
+        (unless (equal (plist-get g :name) "search")
+          (insert (format "%s %d 1 y\n" (plist-get g :name) (plist-get g :high))))))) t)
 (deffoo nndiscourse-retrieve-groups (_groups &optional server)
   (nndiscourse-request-list server) 'active)
 (deffoo nndiscourse-request-list-newsgroups (&optional server)
@@ -650,7 +652,8 @@ Persist an uncertain-send lock before network dispatch."
     (with-current-buffer nntp-server-buffer
       (erase-buffer)
       (dolist (g (nndiscourse--db-groups db))
-        (insert (plist-get g :name) "\t" (nndiscourse--line (plist-get g :title)) "\n")))) t)
+        (unless (equal (plist-get g :name) "search")
+          (insert (plist-get g :name) "\t" (nndiscourse--line (plist-get g :title)) "\n"))))) t)
 
 (deffoo nndiscourse-retrieve-headers (articles &optional group server _fetch-old)
   (let* ((db (nndiscourse--select server)) (record (nndiscourse--group db group)))
@@ -690,8 +693,19 @@ Persist an uncertain-send lock before network dispatch."
          (post (nndiscourse--post db record article)))
     (if (not post) (nnheader-report 'nndiscourse "Article is absent from this topic snapshot")
       (when (and (nndiscourse--list-group-p group) (null (plist-get post :body)))
-        (setq post (nndiscourse--latest-root-body db record post)
-              record (nndiscourse--group db group)))
+        (if (equal group "search")
+            (let* ((topic (plist-get post :topic-id))
+                   (result (nndiscourse--await
+                            (lambda (cb) (nndiscourse--fetch-topic db topic cb))))
+                   (failure (nth 2 result)))
+              (when failure (error "%s" failure))
+              (nndiscourse--replace-group
+               db record (nndiscourse--merge-latest-thread
+                          db record topic (nth 0 result) (nth 1 result)))
+              (setq record (nndiscourse--group db group)
+                    post (nndiscourse--post db record article)))
+          (setq post (nndiscourse--latest-root-body db record post)
+                record (nndiscourse--group db group))))
       (let ((header (nndiscourse--header db record post)))
         (with-current-buffer (or buffer nntp-server-buffer)
           (erase-buffer)
@@ -933,35 +947,94 @@ Persist an uncertain-send lock before network dispatch."
   ((raw-queries-p :initform t))
   :documentation "Search cached Discourse posts through Gnus.")
 
-(defun nndiscourse--search-matches-p (post terms)
-  "Return non-nil when POST contains every word in TERMS."
-  (let ((text (downcase
-               (mapconcat #'identity
-                          (delq nil (mapcar (lambda (key) (plist-get post key))
-                                             '(:title :author :body))) " "))))
-    (cl-every (lambda (term)
-                (string-search (downcase term) text))
-              terms)))
+(defun nndiscourse--search-remote (db method source needle limit)
+  "Search SOURCE's site for NEEDLE and cache matching posts separately.
+METHOD identifies the native Gnus server; LIMIT bounds returned hits."
+  (let* ((category (when (string-match
+                          "\\`category\\.\\([1-9][0-9]*\\)\\.\\([[:alnum:]-]+\\)\\'"
+                          source)
+                     (cons (string-to-number (match-string 1 source))
+                           (match-string 2 source))))
+         (query (if category (concat needle " #" (cdr category)) needle))
+         (response (nndiscourse--await
+                    (lambda (cb)
+                      (nndiscourse--http db 'get "/search.json"
+                                         `(("q" ,query)) cb))))
+         (data (car response))
+         (failure (cadr response))
+         (topics (plist-get data :topics))
+         (posts (plist-get data :posts))
+         (full (gnus-group-prefixed-name "search" method))
+         results)
+    (when failure (error "%s" failure))
+    (unless (and (listp topics) (listp posts))
+      (error "Invalid Discourse search response"))
+    (when posts
+      (let* ((record (nndiscourse--group db "search" t))
+             (copy (copy-sequence record))
+             (entries (mapcar #'copy-sequence (plist-get record :posts)))
+             (high (plist-get record :high)))
+        (dolist (hit posts)
+          (let* ((topic-id (plist-get hit :topic_id))
+                 (floor (plist-get hit :post_number))
+                 (topic (cl-find topic-id topics
+                                 :key (lambda (item) (plist-get item :id))))
+                 (previous (cl-find-if
+                            (lambda (item)
+                              (and (equal (plist-get item :topic-id) topic-id)
+                                   (equal (plist-get item :floor) floor))) entries))
+                 (entry (or previous (list :number (cl-incf high)))))
+            (unless (and (nndiscourse--positive-p topic-id)
+                         (nndiscourse--positive-p floor)
+                         (stringp (plist-get hit :created_at))
+                         (stringp (plist-get hit :username))
+                         (stringp (plist-get topic :title)))
+              (error "Invalid Discourse search hit"))
+            (when (or (null category)
+                      (equal (car category) (plist-get topic :category_id)))
+              (setf (plist-get entry :topic-id) topic-id
+                    (plist-get entry :floor) floor
+                    (plist-get entry :title) (plist-get topic :title)
+                    (plist-get entry :author) (plist-get hit :username)
+                    (plist-get entry :time) (plist-get hit :created_at)
+                    (plist-get entry :parent) nil)
+              (unless previous (push entry entries))
+              (push (vector full (plist-get entry :number) 100) results))))
+        (setf (plist-get copy :high) high
+              (plist-get copy :posts)
+              (sort entries (lambda (a b) (< (plist-get a :number)
+                                               (plist-get b :number)))))
+        (nndiscourse--replace-group db record copy)
+        (when (and results (boundp 'gnus-group-buffer)
+                   (buffer-live-p gnus-group-buffer))
+          (with-current-buffer gnus-group-buffer
+            (unless (gnus-get-info full)
+              (gnus-group-make-group "search" method)
+              (gnus-group-change-level (gnus-group-entry full) 9))))))
+    (seq-take (nreverse results) limit)))
 
 (cl-defmethod gnus-search-run-search ((engine gnus-search-nndiscourse)
                                       server query groups)
-  "Search cached Discourse articles in GROUPS on SERVER for QUERY."
+  "Search Discourse posts in GROUPS on SERVER for QUERY."
   (let* ((method (gnus-server-to-method server))
          (db (nndiscourse--select (cadr method)))
          (needle (gnus-search-make-query-string engine query))
-         (terms (split-string (or needle "") "[[:space:]]+" t))
          (targets (or groups
                       (mapcar (lambda (group)
                                 (gnus-group-full-name (plist-get group :name) server))
                               (nndiscourse--db-groups db))))
          (limit (alist-get 'limit query))
          results)
-    (unless terms (user-error "Enter a Discourse search query"))
+    (unless (and (stringp needle) (not (string-empty-p (string-trim needle))))
+      (user-error "Enter a Discourse search query"))
     (dolist (full targets)
       (when-let* ((group (nndiscourse--group db (gnus-group-short-name full))))
-        (dolist (post (plist-get group :posts))
-          (when (nndiscourse--search-matches-p post terms)
-            (push (vector full (plist-get post :number) 100) results)))))
+        (when (or (equal (plist-get group :name) "latest")
+                  (string-prefix-p "category." (plist-get group :name)))
+          (dolist (hit (nndiscourse--search-remote
+                        db method (plist-get group :name) needle
+                        (if (and (integerp limit) (> limit 0)) limit 50)))
+            (push hit results)))))
     (setq results (nreverse results))
     (vconcat (if (and (integerp limit) (>= limit 0))
                  (seq-take results limit)

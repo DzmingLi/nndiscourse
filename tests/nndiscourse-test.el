@@ -2,25 +2,6 @@
 (require 'ert)
 (require 'nndiscourse)
 
-(ert-deftest nndiscourse-test-gnus-search-finds-cached-replies ()
-  (let* ((record '(:name "latest" :posts
-                   ((:number 2 :title "Org guide" :author "Ada"
-                     :body "<p>Outline basics</p>")
-                    (:number 7 :title "Org guide" :author "Bob"
-                     :body "<p>Nested reply</p>"))))
-         (db (make-nndiscourse--db :groups (list record)))
-         (engine (make-instance 'gnus-search-nndiscourse)))
-    (cl-letf (((symbol-function 'gnus-server-to-method)
-               (lambda (_) '(nndiscourse "example.org")))
-              ((symbol-function 'nndiscourse--select) (lambda (_) db)))
-      (should (equal (gnus-search-run-search
-                      engine "nndiscourse:example.org" '((query . "nested reply"))
-                      '("nndiscourse+example.org:latest"))
-                     [["nndiscourse+example.org:latest" 7 100]]))
-      (should (equal (gnus-search-run-search
-                      engine "nndiscourse:example.org" '((query . "missing"))
-                      '("nndiscourse+example.org:latest"))
-                     [])))))
 (defmacro nndiscourse-test-with-db (&rest body)
   (declare (indent 0))
   `(let* ((directory (make-temp-file "nndiscourse-test-" t))
@@ -29,12 +10,74 @@
           (auth-sources nil)
           (discourse-auth--credentials (make-hash-table :test #'equal)))
      (unwind-protect (progn ,@body) (delete-directory directory t))))
+
+(ert-deftest nndiscourse-test-gnus-search-imports-site-history ()
+  (nndiscourse-test-with-db
+    (nndiscourse--group db "latest" t)
+    (let ((engine (make-instance 'gnus-search-nndiscourse)) requested)
+      (cl-letf (((symbol-function 'gnus-server-to-method)
+                 (lambda (_) '(nndiscourse "example.org")))
+                ((symbol-function 'nndiscourse--select) (lambda (_) db))
+                ((symbol-function 'nndiscourse--http)
+                 (lambda (_db _method path fields callback)
+                   (setq requested (list path fields))
+                   (funcall callback
+                            '(:posts ((:id 501 :topic_id 42 :post_number 3
+                                       :username "Ada" :created_at "2026-10-01T12:00:00Z"))
+                              :topics ((:id 42 :title "Old topic" :category_id 7)))
+                            nil nil))))
+        (should (equal (gnus-search-run-search
+                        engine "nndiscourse:example.org" '((query . "old"))
+                        '("nndiscourse+example.org:latest"))
+                       [["nndiscourse+example.org:search" 1 100]]))
+        (should (equal "/search.json" (car requested)))
+        (should (equal "old" (cadr (assoc "q" (cadr requested)))))
+        (should (equal 3 (plist-get (nndiscourse--post
+                                    db (nndiscourse--group db "search") 1)
+                                   :floor)))))))
+
+(ert-deftest nndiscourse-test-search-respects-category ()
+  (nndiscourse-test-with-db
+    (nndiscourse--group db "category.8.org-mode" t)
+    (let (requested)
+      (cl-letf (((symbol-function 'nndiscourse--http)
+                 (lambda (_db _method _path fields callback)
+                   (setq requested fields)
+                   (funcall callback
+                            '(:posts ((:id 501 :topic_id 42 :post_number 1
+                                       :username "Ada" :created_at "2026-10-01T12:00:00Z"))
+                              :topics ((:id 42 :title "Other category" :category_id 7)))
+                            nil nil))))
+        (should (null (nndiscourse--search-remote
+                       db '(nndiscourse "example.org")
+                       "category.8.org-mode" "test" 20)))
+        (should (equal "test #org-mode" (cadr (assoc "q" requested))))))))
 (defun nndiscourse-test-post (id floor &optional parent)
   (list :id id :post_number floor :topic_id 42 :reply_to_post_number parent
         :username "someone" :created_at "2026-10-01T12:00:00Z" :cooked "<p>正文</p>"))
 (defun nndiscourse-test-topic ()
   (list :id 42 :title "Example" :post_stream
         (list :stream '(100 110 140) :posts (list (nndiscourse-test-post 100 1)))))
+
+(ert-deftest nndiscourse-test-search-hit-opens-matching-reply ()
+  (nndiscourse-test-with-db
+    (let* ((group (nndiscourse--group db "search" t))
+           (hit (list :number 1 :topic-id 42 :floor 3 :title "Example"
+                      :author "Ada" :time "2026-10-01T12:00:00Z" :body nil)))
+      (setf (plist-get group :posts) (list hit)
+            (plist-get group :high) 1)
+      (cl-letf (((symbol-function 'nndiscourse--fetch-topic)
+                 (lambda (_db _topic callback)
+                   (funcall callback "Example"
+                            (list (nndiscourse-test-post 100 1)
+                                  (nndiscourse-test-post 110 2 1)
+                                  (nndiscourse-test-post 140 3 2)) nil))))
+        (with-temp-buffer
+          (should (equal '("search" . 1)
+                         (nndiscourse-request-article 1 "search" nil (current-buffer))))
+          (should (string-match-p "Example" (buffer-string)))
+          (should (plist-get (nndiscourse--post db (nndiscourse--group db "search") 1)
+                             :body)))))))
 (defun nndiscourse-test-latest (&optional reverse)
   (list :users '((:id 7 :username "original") (:id 8 :username "another"))
         :topic_list

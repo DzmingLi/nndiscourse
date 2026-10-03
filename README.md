@@ -41,9 +41,10 @@ The Gnus backend's snapshot lives under `gnus-directory/nndiscourse-topics/` wit
 ## Gnus search
 
 Gnus search is available with `G g` in the Group buffer. The search engine
-finds topics and replies already fetched into nndiscourse groups. A search
-does not import historical site results into a subscribed inbox. Queries are
-case-insensitive words matched against cached title, author, and body text.
+calls the site's native `/search.json` for the selected `latest` or category
+groups. Matching posts are kept in an internal search group, so historical
+results do not enter a subscribed inbox. Category group searches are scoped
+to that category.
 
 ## Test
 
