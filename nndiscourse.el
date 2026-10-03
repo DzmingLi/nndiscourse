@@ -2,7 +2,7 @@
 ;; Copyright (C) 2019 The Authors of nndiscourse.el
 ;; Copyright (C) 2026 Dzming Li
 ;; SPDX-License-Identifier: GPL-3.0-or-later
-;; Version: 0.3.2
+;; Version: 0.3.3
 ;; Keywords: news, comm
 ;; URL: https://github.com/DzmingLi/nndiscourse
 ;; Package-Requires: ((emacs "29.1") (plz "0.9.1"))
@@ -1006,11 +1006,11 @@ METHOD identifies the native Gnus server; LIMIT bounds returned hits."
                                                (plist-get b :number)))))
         (nndiscourse--replace-group db record copy)
         (when (and results (boundp 'gnus-group-buffer)
-                   (buffer-live-p gnus-group-buffer))
+                   (get-buffer gnus-group-buffer))
           (with-current-buffer gnus-group-buffer
             (unless (gnus-get-info full)
               (gnus-group-make-group "search" method)
-              (gnus-group-change-level (gnus-group-entry full) 9))))))
+              (gnus-group-change-level (gnus-group-entry full) 7))))))
     (seq-take (nreverse results) limit)))
 
 (cl-defmethod gnus-search-run-search ((engine gnus-search-nndiscourse)
