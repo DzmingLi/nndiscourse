@@ -38,6 +38,13 @@ A reply uses `topic_id`, `reply_to_post_number`, and `raw`; a new topic uses `ti
 
 The Gnus backend's snapshot lives under `gnus-directory/nndiscourse-topics/` with private permissions. It atomically replaces a topic only after all post IDs have been retrieved and validated. Missing parent posts become placeholders. A refresh never resets Gnus read marks.
 
+## Gnus search
+
+Gnus search is available with `G g` in the Group buffer. The search engine
+finds topics and replies already fetched into nndiscourse groups. A search
+does not import historical site results into a subscribed inbox. Queries are
+case-insensitive words matched against cached title, author, and body text.
+
 ## Test
 
 ```sh

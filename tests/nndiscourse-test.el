@@ -1,6 +1,26 @@
 ;;; nndiscourse-test.el --- Native backend tests -*- lexical-binding: t; -*-
 (require 'ert)
 (require 'nndiscourse)
+
+(ert-deftest nndiscourse-test-gnus-search-finds-cached-replies ()
+  (let* ((record '(:name "latest" :posts
+                   ((:number 2 :title "Org guide" :author "Ada"
+                     :body "<p>Outline basics</p>")
+                    (:number 7 :title "Org guide" :author "Bob"
+                     :body "<p>Nested reply</p>"))))
+         (db (make-nndiscourse--db :groups (list record)))
+         (engine (make-instance 'gnus-search-nndiscourse)))
+    (cl-letf (((symbol-function 'gnus-server-to-method)
+               (lambda (_) '(nndiscourse "example.org")))
+              ((symbol-function 'nndiscourse--select) (lambda (_) db)))
+      (should (equal (gnus-search-run-search
+                      engine "nndiscourse:example.org" '((query . "nested reply"))
+                      '("nndiscourse+example.org:latest"))
+                     [["nndiscourse+example.org:latest" 7 100]]))
+      (should (equal (gnus-search-run-search
+                      engine "nndiscourse:example.org" '((query . "missing"))
+                      '("nndiscourse+example.org:latest"))
+                     [])))))
 (defmacro nndiscourse-test-with-db (&rest body)
   (declare (indent 0))
   `(let* ((directory (make-temp-file "nndiscourse-test-" t))

@@ -2,7 +2,7 @@
 ;; Copyright (C) 2019 The Authors of nndiscourse.el
 ;; Copyright (C) 2026 Dzming Li
 ;; SPDX-License-Identifier: GPL-3.0-or-later
-;; Version: 0.3.0
+;; Version: 0.3.1
 ;; Keywords: news, comm
 ;; URL: https://github.com/DzmingLi/nndiscourse
 ;; Package-Requires: ((emacs "29.1") (plz "0.9.1"))
@@ -13,6 +13,7 @@
 ;;; Code:
 (require 'cl-lib)
 (require 'subr-x)
+(require 'seq)
 (require 'json)
 (require 'discourse-auth)
 (require 'gnus)
@@ -20,6 +21,7 @@
 (require 'gnus-sum)
 (require 'gnus-start)
 (require 'gnus-msg)
+(require 'gnus-search)
 (require 'nnoo)
 (require 'nnheader)
 (require 'rfc2047)
@@ -923,6 +925,50 @@ Persist an uncertain-send lock before network dispatch."
           (cl-remove "pending" (nndiscourse--db-attempts db)
                      :test #'equal :key (lambda (item) (plist-get item :state))))
     (nndiscourse--save db)))
+
+;; Search the articles with stable Gnus numbers in this site's snapshots.
+;; Remote results need a separate search cache to avoid turning historical
+;; topics into new unread articles in subscribed latest/category groups.
+(defclass gnus-search-nndiscourse (gnus-search-engine)
+  ((raw-queries-p :initform t))
+  :documentation "Search cached Discourse posts through Gnus.")
+
+(defun nndiscourse--search-matches-p (post terms)
+  "Return non-nil when POST contains every word in TERMS."
+  (let ((text (downcase
+               (mapconcat #'identity
+                          (delq nil (mapcar (lambda (key) (plist-get post key))
+                                             '(:title :author :body))) " "))))
+    (cl-every (lambda (term)
+                (string-search (downcase term) text))
+              terms)))
+
+(cl-defmethod gnus-search-run-search ((engine gnus-search-nndiscourse)
+                                      server query groups)
+  "Search cached Discourse articles in GROUPS on SERVER for QUERY."
+  (let* ((method (gnus-server-to-method server))
+         (db (nndiscourse--select (cadr method)))
+         (needle (gnus-search-make-query-string engine query))
+         (terms (split-string (or needle "") "[[:space:]]+" t))
+         (targets (or groups
+                      (mapcar (lambda (group)
+                                (gnus-group-full-name (plist-get group :name) server))
+                              (nndiscourse--db-groups db))))
+         (limit (alist-get 'limit query))
+         results)
+    (unless terms (user-error "Enter a Discourse search query"))
+    (dolist (full targets)
+      (when-let* ((group (nndiscourse--group db (gnus-group-short-name full))))
+        (dolist (post (plist-get group :posts))
+          (when (nndiscourse--search-matches-p post terms)
+            (push (vector full (plist-get post :number) 100) results)))))
+    (setq results (nreverse results))
+    (vconcat (if (and (integerp limit) (>= limit 0))
+                 (seq-take results limit)
+               results))))
+
+(add-to-list 'gnus-search-default-engines
+             '(nndiscourse . gnus-search-nndiscourse))
 
 (gnus-declare-backend "nndiscourse" 'address)
 (nnoo-define-skeleton nndiscourse)
